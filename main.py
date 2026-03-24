@@ -194,7 +194,6 @@ async def admin_stats(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "send_number")
 async def call_send_number(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    username = callback.from_user.username or callback.from_user.full_name
     
     try:
         await callback.message.delete()
@@ -204,24 +203,11 @@ async def call_send_number(callback: types.CallbackQuery):
     await callback.answer()
     
     async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT current_number, number_timestamp, waiting_for_number FROM users WHERE user_id = $1", user_id)
+        waiting = await conn.fetchval("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
         
-        if user and user["waiting_for_number"]:
+        if waiting:
             await bot.send_message(user_id, "<b>⏳ У вас уже есть активная заявка! Отправьте номер</b>", parse_mode="HTML")
             return
-        
-        if user and user["current_number"] and user["number_timestamp"]:
-            elapsed = int(time.time()) - user["number_timestamp"]
-            if elapsed < 600:
-                remaining = 600 - elapsed
-                minutes = remaining // 60
-                seconds = remaining % 60
-                await bot.send_message(
-                    user_id,
-                    f"<b>⏳ Этот номер недавно обрабатывался</b>\n<i>Его можно поставить повторно только через</i> <code>{minutes:02d}:{seconds:02d}</code>",
-                    parse_mode="HTML"
-                )
-                return
         
         await conn.execute("UPDATE users SET waiting_for_number = TRUE WHERE user_id = $1", user_id)
     
@@ -241,8 +227,8 @@ async def call_send_number(callback: types.CallbackQuery):
 async def timeout_number(user_id: int):
     await asyncio.sleep(60)
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
-        if row and row["waiting_for_number"]:
+        waiting = await conn.fetchval("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
+        if waiting:
             await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
             await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
 
@@ -262,7 +248,7 @@ async def cancel_number(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# ========== ГЛАВНЫЙ ХЭНДЛЕР ВСЕХ СООБЩЕНИЙ ==========
+# ========== ГЛАВНЫЙ ХЭНДЛЕР ==========
 @dp.message()
 async def handle_all_messages(message: types.Message):
     user_id = message.from_user.id
@@ -275,11 +261,33 @@ async def handle_all_messages(message: types.Message):
         waiting_number = await conn.fetchval("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
         
         if waiting_number:
+            number = text
+            
+            # Проверяем, не ставился ли этот номер недавно
+            last_time = await conn.fetchval(
+                "SELECT number_timestamp FROM users WHERE user_id = $1 AND current_number = $2",
+                user_id, number
+            )
+            
+            if last_time:
+                elapsed = int(time.time()) - last_time
+                if elapsed < 600:
+                    remaining = 600 - elapsed
+                    minutes = remaining // 60
+                    seconds = remaining % 60
+                    await message.answer(
+                        f"<b>⏳ Этот номер недавно обрабатывался</b>\n<i>Его можно поставить повторно только через</i> <code>{minutes:02d}:{seconds:02d}</code>",
+                        parse_mode="HTML"
+                    )
+                    await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
+                    return
+            
+            # Номер не блокирован - принимаем
             await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
             
-            number = text
             username = message.from_user.username or message.from_user.full_name
             
+            # Сохраняем номер и время
             await conn.execute('''
                 UPDATE users SET current_number = $1, number_timestamp = $2 WHERE user_id = $3
             ''', number, int(time.time()), user_id)
@@ -362,8 +370,8 @@ async def request_sms(callback: types.CallbackQuery):
 async def timeout_sms(user_id: int):
     await asyncio.sleep(60)
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
-        if row and row["waiting_for_sms"]:
+        waiting = await conn.fetchval("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
+        if waiting:
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
             await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
@@ -373,6 +381,14 @@ async def reject_request(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     
     async with db_pool.acquire() as conn:
+        # Получаем номер из заявки
+        row = await conn.fetchrow("SELECT number FROM requests WHERE user_id = $1", user_id)
+        if row:
+            number = row["number"]
+            # Сохраняем время отправки этого номера для таймера
+            await conn.execute("UPDATE users SET number_timestamp = $1 WHERE user_id = $2 AND current_number = $3", 
+                               int(time.time()), user_id, number)
+        
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
@@ -406,6 +422,9 @@ async def number_accepted(callback: types.CallbackQuery):
         
         await conn.execute("UPDATE users SET balance = balance + 4.00 WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
+        # При успешном принятии НЕ обновляем number_timestamp, чтобы номер можно было ставить снова
+        # Удаляем current_number чтобы не мешал
+        await conn.execute("UPDATE users SET current_number = NULL WHERE user_id = $1", user_id)
     
     await bot.send_message(
         user_id,
@@ -420,6 +439,14 @@ async def number_registered(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     
     async with db_pool.acquire() as conn:
+        # Получаем номер из заявки
+        row = await conn.fetchrow("SELECT number FROM requests WHERE user_id = $1", user_id)
+        if row:
+            number = row["number"]
+            # Сохраняем время отправки этого номера для таймера
+            await conn.execute("UPDATE users SET number_timestamp = $1 WHERE user_id = $2 AND current_number = $3", 
+                               int(time.time()), user_id, number)
+        
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
@@ -443,6 +470,14 @@ async def got_error(callback: types.CallbackQuery):
             return
         reason = message.text
         async with db_pool.acquire() as conn:
+            # Получаем номер из заявки
+            row = await conn.fetchrow("SELECT number FROM requests WHERE user_id = $1", user_id)
+            if row:
+                number = row["number"]
+                # Сохраняем время отправки этого номера для таймера
+                await conn.execute("UPDATE users SET number_timestamp = $1 WHERE user_id = $2 AND current_number = $3", 
+                                   int(time.time()), user_id, number)
+            
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
         
@@ -455,8 +490,16 @@ async def cancel_sms(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
+        # Получаем номер из заявки
+        row = await conn.fetchrow("SELECT number FROM requests WHERE user_id = $1", user_id)
+        if row:
+            number = row["number"]
+            # Сохраняем время отправки этого номера для таймера
+            await conn.execute("UPDATE users SET number_timestamp = $1 WHERE user_id = $2 AND current_number = $3", 
+                               int(time.time()), user_id, number)
+        
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
     await callback.message.answer("<b>❌ Заявка отменена</b>", parse_mode="HTML")
     await callback.answer()
