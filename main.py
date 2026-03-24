@@ -388,6 +388,10 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
+            # Удаляем старое сообщение "Заявка принята! Отправьте номер"
+            await delete_status_message(user_id)
+            
+            # Создаем НОВОЕ сообщение со статусом
             await update_status_message(
                 user_id,
                 "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>"
@@ -439,6 +443,7 @@ async def request_sms(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_sms")]
     ])
     
+    # МЕНЯЕМ существующее сообщение (статус меняется)
     await update_status_message(
         user_id,
         "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
