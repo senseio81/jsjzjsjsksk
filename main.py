@@ -146,7 +146,7 @@ async def timeout_number(user_id: int):
         waiting = await conn.fetchval("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
         if waiting:
             await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
-            await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
+            await bot.send_message(user_id, "<b>⏱️ Заявка отменена!</b>\n<i>Причина: вышло время</i>", parse_mode="HTML")
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -354,7 +354,7 @@ async def handle_all_messages(message: types.Message):
             
             await bot.send_message(
                 user_id,
-                "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>",
+                "<b>💼 Номер принят!</b>\n<i>Ожидайте запроса SMS на ваш номер (обычно занимает до 2-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>",
                 parse_mode="HTML"
             )
             return
@@ -405,7 +405,7 @@ async def request_sms(callback: types.CallbackQuery):
     
     await bot.send_message(
         user_id,
-        "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
+        "<b>💼 Номер принят!</b>\n<i>Ожидайте запроса SMS на ваш номер (обычно занимает до 2-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -421,7 +421,7 @@ async def timeout_sms(user_id: int):
         if waiting:
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
-            await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
+            await bot.send_message(user_id, "<b>⏱️ Заявка отменена!</b>\n<i>Причина: вышло время</i>", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: types.CallbackQuery):
