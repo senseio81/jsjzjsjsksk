@@ -159,21 +159,6 @@ async def start_send_number(user_id: int, message=None):
             request_taken = False
             return
         
-        user = await conn.fetchrow("SELECT current_number, number_timestamp FROM users WHERE user_id = $1", user_id)
-        if user and user["current_number"] and user["number_timestamp"]:
-            elapsed = int(time.time()) - user["number_timestamp"]
-            if elapsed < 600:
-                remaining = 600 - elapsed
-                minutes = remaining // 60
-                seconds = remaining % 60
-                await bot.send_message(
-                    user_id,
-                    f"<b>⏳ Этот номер недавно обрабатывался</b>\n<i>Его можно поставить повторно только через</i> <code>{minutes:02d}:{seconds:02d}</code>",
-                    parse_mode="HTML"
-                )
-                request_taken = False
-                return
-        
         await conn.execute("UPDATE users SET waiting_for_number = TRUE WHERE user_id = $1", user_id)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
